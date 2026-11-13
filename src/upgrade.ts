@@ -9,6 +9,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -87,11 +88,16 @@ export async function upgradeRepository(
       env: gitEnv,
     });
 
+    // Code of the repository may run from here on. Whatever it does to the
+    // git configuration (a proxy, a rewritten URL, a filter) is undone before
+    // git works with the token again.
+    const gitConfig = readFileSync(join(clone, '.git', 'config'));
     const workspace = prepareWorkspace(target, { clone, work, env });
     checkout = workspace.checkout;
 
     console.log(`==> ${repo}: ${lspVersion} check --fix`);
     const summary = check(target, { lspBin, workspace, work, env });
+    writeFileSync(join(checkout, '.git', 'config'), gitConfig);
 
     git(['add', '--update', '--', ...target.paths]);
     const changed = !gitSucceeds(['diff', '--cached', '--quiet']);
@@ -291,17 +297,22 @@ function prepareWorkspace(
  */
 function prepareShop(target: Target, root: string, env: NodeJS.ProcessEnv): void {
   const { repo } = target;
+  // npm reads configuration of the directory it runs in, and bin/ci runs the
+  // repository's PHP code: neither gets more of the bot's environment than a
+  // program needs to start.
+  const { PATH, HOME, TMPDIR, LANG } = env;
+  const bare = { PATH, HOME, TMPDIR, LANG };
 
   if (target.npm_install) {
     for (const name of ['administration', 'storefront']) {
       const app = join(root, 'vendor', 'shopware', name, 'Resources', 'app', name);
-      if (!existsSync(join(app, 'package.json'))) {
+      // Only an exact, locked install.
+      if (!existsSync(join(app, 'package-lock.json'))) {
         continue;
       }
-      console.log(`==> ${repo}: npm install for the ${name}`);
-      const command = existsSync(join(app, 'package-lock.json')) ? 'ci' : 'install';
-      if (tryRun('npm', [command, '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: app, env }) === null) {
-        console.warn(`==> ${repo}: npm ${command} failed for the ${name}, continuing without it`);
+      console.log(`==> ${repo}: npm ci for the ${name}`);
+      if (tryRun('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: app, env: bare }) === null) {
+        console.warn(`==> ${repo}: npm ci failed for the ${name}, continuing without it`);
       }
     }
   }
@@ -310,7 +321,6 @@ function prepareShop(target: Target, root: string, env: NodeJS.ProcessEnv): void
   // database; the dev environment dumps the container the index reads.
   if (target.compile_container && existsSync(join(root, 'bin', 'ci'))) {
     console.log(`==> ${repo}: compiling the container with bin/ci`);
-    const { COMPOSER_AUTH: _auth, ...bare } = env;
     const booted = tryRun('php', ['bin/ci', '--env=dev', 'list', '--quiet'], {
       cwd: root,
       env: { ...bare, APP_ENV: 'dev', DATABASE_URL: '' },

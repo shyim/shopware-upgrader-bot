@@ -21,5 +21,6 @@ export default defineConfig({
 
   repositories: [
     { repo: 'FriendsOfShopware/FroshTools', type: 'plugin' },
+    { repo: 'FriendsOfShopware/FroshPlatformMailArchive', type: 'plugin' },
   ],
 });
