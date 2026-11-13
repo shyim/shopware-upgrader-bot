@@ -1,0 +1,11 @@
+{
+  "name": "shopware-upgrader-bot",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "node bin/bot.ts matrix"
+  }
+}

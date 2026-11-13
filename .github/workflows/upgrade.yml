@@ -1,0 +1,154 @@
+name: Upgrade repositories
+
+# Runs `shopware-lsp check --fix` on every repository of repositories.json and
+# opens or updates a pull request with the result.
+#
+#   prepare (repository list, shopware-lsp binary) ─ upgrade (one job per repository)
+
+on:
+  schedule:
+    # Mondays, 05:00 UTC.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Only this repository (owner/name); empty runs all of them
+        required: false
+        type: string
+      dry_run:
+        description: Show what would change without pushing or opening pull requests
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upgrade
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      repositories: ${{ steps.matrix.outputs.repositories }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+
+      - name: List repositories
+        id: matrix
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+        run: |
+          repositories="$(node bin/bot.ts matrix "$REPOSITORY")"
+          echo "repositories=$repositories" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve shopware-lsp version
+        id: lsp
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node bin/bot.ts lsp resolve | tee -a "$GITHUB_OUTPUT"
+
+      - name: Restore shopware-lsp binary
+        id: binary
+        uses: actions/cache@v5.0.4
+        with:
+          path: dist/shopware-lsp
+          key: shopware-lsp-${{ runner.os }}-${{ runner.arch }}-${{ steps.lsp.outputs.key }}
+
+      - name: Download release binary
+        if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'release'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LSP_REF: ${{ steps.lsp.outputs.ref }}
+        run: node bin/bot.ts lsp download "$LSP_REF" dist
+
+      # `lsp.version: source:<ref>`: build that commit of shopware/shopware-lsp.
+      - name: Checkout shopware-lsp
+        if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'source'
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: shopware/shopware-lsp
+          ref: ${{ steps.lsp.outputs.ref }}
+          path: lsp-src
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'source'
+        working-directory: lsp-src
+        # rust-toolchain.toml pins the channel.
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2.9.3
+        if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'source'
+        with:
+          workspaces: lsp-src
+          cache-on-failure: true
+
+      - name: Build shopware-lsp
+        if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'source'
+        working-directory: lsp-src
+        env:
+          SHOPWARE_LSP_VERSION: ${{ steps.lsp.outputs.ref }}
+        run: |
+          cargo build --locked --release -p swlsp-cli
+          mkdir -p ../dist
+          cp target/release/shopware-lsp ../dist/shopware-lsp
+
+      - name: Verify shopware-lsp
+        run: node bin/bot.ts lsp verify dist/shopware-lsp
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: shopware-lsp
+          path: dist/shopware-lsp
+          retention-days: 1
+
+  upgrade:
+    name: ${{ matrix.repository }}
+    needs: prepare
+    if: needs.prepare.outputs.repositories != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        repository: ${{ fromJSON(needs.prepare.outputs.repositories) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: shopware-lsp
+          path: dist
+
+      - name: Fix and open pull request
+        env:
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          # Lets composer download from GitHub without hitting the anonymous rate limit.
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ github.token }}"}}'
+          REPOSITORY: ${{ matrix.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          chmod +x dist/shopware-lsp
+          args=(run "$REPOSITORY" --lsp "$PWD/dist/shopware-lsp")
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          node bin/bot.ts "${args[@]}"
