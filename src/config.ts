@@ -18,6 +18,17 @@ export interface RepositoryOptions {
    */
   composer_install?: boolean;
   /**
+   * Run `npm ci` (without scripts) for Shopware's Administration and
+   * Storefront, so their JavaScript dependencies are known. Default: `true`.
+   */
+  npm_install?: boolean;
+  /**
+   * Boot the shop once with `bin/ci`, without a database, so the compiled
+   * container is in var/cache and services and parameters are known. This
+   * runs the PHP code of the repository on the runner. Default: `true`.
+   */
+  compile_container?: boolean;
+  /**
    * Composer constraint of the shop a plugin is checked in. Default: the
    * plugin's own `shopware/core` requirement, of which the newest match is used.
    */
@@ -75,6 +86,8 @@ const BUILT_IN_DEFAULTS: Required<RepositoryOptions> = {
   only: [],
   args: [],
   composer_install: true,
+  npm_install: true,
+  compile_container: true,
   shopware_version: '',
   pr_branch: 'shopware-lsp/auto-fix',
   pr_title: 'chore: apply shopware-lsp fixes',

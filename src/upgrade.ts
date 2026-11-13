@@ -241,6 +241,7 @@ function prepareWorkspace(
       console.log(`==> ${repo}: composer install`);
       run('composer', ['install', ...COMPOSER_FLAGS, '--no-plugins'], { cwd: clone, env });
     }
+    prepareShop(target, clone, env);
     return standalone;
   }
 
@@ -279,7 +280,45 @@ function prepareWorkspace(
     ['require', ...COMPOSER_FLAGS, '--no-plugins', '--with-all-dependencies', `${manifest.name}:*@dev`],
     { cwd: shop, env },
   );
+  prepareShop(target, shop, env);
   return { root: shop, checkout: join(shop, prefix), prefix };
+}
+
+/**
+ * Adds what the index reads beyond the PHP vendors: the JavaScript
+ * dependencies of Shopware's Administration and Storefront, and the compiled
+ * container. Both only widen what is known, so a failure is not fatal.
+ */
+function prepareShop(target: Target, root: string, env: NodeJS.ProcessEnv): void {
+  const { repo } = target;
+
+  if (target.npm_install) {
+    for (const name of ['administration', 'storefront']) {
+      const app = join(root, 'vendor', 'shopware', name, 'Resources', 'app', name);
+      if (!existsSync(join(app, 'package.json'))) {
+        continue;
+      }
+      console.log(`==> ${repo}: npm install for the ${name}`);
+      const command = existsSync(join(app, 'package-lock.json')) ? 'ci' : 'install';
+      if (tryRun('npm', [command, '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: app, env }) === null) {
+        console.warn(`==> ${repo}: npm ${command} failed for the ${name}, continuing without it`);
+      }
+    }
+  }
+
+  // bin/ci boots Shopware with the plugins Composer knows and a placeholder
+  // database; the dev environment dumps the container the index reads.
+  if (target.compile_container && existsSync(join(root, 'bin', 'ci'))) {
+    console.log(`==> ${repo}: compiling the container with bin/ci`);
+    const { COMPOSER_AUTH: _auth, ...bare } = env;
+    const booted = tryRun('php', ['bin/ci', '--env=dev', 'list', '--quiet'], {
+      cwd: root,
+      env: { ...bare, APP_ENV: 'dev', DATABASE_URL: '' },
+    });
+    if (booted === null) {
+      console.warn(`==> ${repo}: bin/ci failed, continuing without the compiled container`);
+    }
+  }
 }
 
 /** Runs the fixer and returns its summary (what it writes to stderr). */

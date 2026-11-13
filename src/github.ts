@@ -54,8 +54,26 @@ export function createGitHub(token?: string): GitHub {
     ...(token ? { authorization: `Bearer ${token}` } : {}),
   };
 
+  /**
+   * The bot blocks for minutes in composer and the fixer between two calls;
+   * by then GitHub has closed the kept-alive connection and the next request
+   * fails before it is sent. Such a request is safe to repeat.
+   */
+  async function send(url: string, init: RequestInit): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await fetch(url, init);
+      } catch (error) {
+        if (attempt === 3) {
+          const cause = (error as Error).cause;
+          throw new Error(`${init.method ?? 'GET'} ${url}: ${(error as Error).message}`, { cause });
+        }
+      }
+    }
+  }
+
   async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const response = await fetch(`${API}${path}`, {
+    const response = await send(`${API}${path}`, {
       method,
       headers: body === undefined ? headers : { ...headers, 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -74,7 +92,7 @@ export function createGitHub(token?: string): GitHub {
 
     async getFile(path) {
       // fetch drops the authorization header when GitHub redirects to its storage.
-      const response = await fetch(`${API}${path}`, { headers });
+      const response = await send(`${API}${path}`, { headers });
       if (!response.ok) {
         throw new GitHubError('GET', path, response.status, await response.text());
       }
@@ -82,7 +100,7 @@ export function createGitHub(token?: string): GitHub {
     },
 
     async download(url) {
-      const response = await fetch(url, { headers: { 'user-agent': headers['user-agent']! } });
+      const response = await send(url, { headers: { 'user-agent': headers['user-agent']! } });
       if (!response.ok) {
         throw new Error(`GET ${url}: ${response.status}`);
       }

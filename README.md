@@ -52,6 +52,8 @@ export default defineConfig({
     only: [],                  // rule IDs or prefixes ('twig.html.*'); empty = all
     args: [],                  // extra `check` flags, e.g. '--allow-unsupported-project'
     composer_install: true,    // false checks the clone as it is
+    npm_install: true,         // npm ci for Shopware's Administration and Storefront
+    compile_container: true,   // boot once with bin/ci so var/cache has the container
     pr_branch: 'shopware-lsp/auto-fix',
     pr_title: 'chore: apply shopware-lsp fixes',
     commit_message: 'chore: apply shopware-lsp fixes',
@@ -88,10 +90,22 @@ Every entry says what the repository is:
 - `type: 'project'`: a whole Shopware or Symfony project. The bot runs
   `composer install` in the clone and checks it in place.
 
-No scripts and no plugins of the checked code run during these installs; only
-Symfony Flex of the Shopware template does, to lay out the shop. The shop has
-no database and its container is not compiled, so findings that need the
-compiled container (missing services and parameters) are not reported.
+In both cases the bot then, where the files exist:
+
+- runs `npm ci --ignore-scripts` for Shopware's Administration and Storefront
+  (`npm_install`), so their JavaScript dependencies are known,
+- boots the shop once with `bin/ci --env=dev` and a placeholder database
+  (`compile_container`), so the compiled container is in `var/cache` and
+  services and parameters are known.
+
+A failure of either is logged and the check goes on without it.
+
+No Composer or npm scripts and no Composer plugins of the checked code run
+during the installs; only Symfony Flex of the Shopware template does, to lay
+out the shop. `compile_container` is different: booting the shop **runs the
+PHP code of the repository and its dependencies** on the runner, in the job
+that holds `BOT_GITHUB_TOKEN`. List only repositories you trust, or set
+`compile_container: false` for the others.
 
 No release ships `check --fix` yet, so `lsp.version` points at the branch that
 has it. For a `source:<ref>` version the bot downloads the newest binary that
