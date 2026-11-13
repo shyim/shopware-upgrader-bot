@@ -13,5 +13,5 @@
     "rewriteRelativeImportExtensions": false,
     "skipLibCheck": true
   },
-  "include": ["bin", "src"]
+  "include": ["bin", "src", "repositories.ts"]
 }

@@ -1,13 +1,38 @@
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, mkdtempSync, openSync, rmSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { Target } from './config.ts';
 import { run, tryRun, type RunOptions } from './exec.ts';
 import type { GitHub, PullRequest } from './github.ts';
 import { verifyLsp } from './lsp.ts';
 
 const SUMMARY_LIMIT = 4000;
+
+/** Scripts and plugins of the checked code never run; platform requirements do not matter for an index. */
+const COMPOSER_FLAGS = ['--no-interaction', '--no-progress', '--no-scripts', '--ignore-platform-reqs'];
+const COMPOSER_PACKAGE = /^[a-z0-9]([_.-]?[a-z0-9]+)*\/[a-z0-9](([_.]|-{1,2})?[a-z0-9]+)*$/;
+
+/** Where the fixer runs, and where the cloned repository is inside it. */
+interface Workspace {
+  /** Workspace root handed to shopware-lsp. */
+  root: string;
+  /** The git checkout: `root` itself, or the plugin directory of a shop. */
+  checkout: string;
+  /** `checkout` relative to `root`. */
+  prefix: string;
+}
 
 export interface UpgradeOptions {
   github: GitHub;
@@ -20,18 +45,20 @@ export interface UpgradeOptions {
 
 /**
  * Clones one repository, applies `shopware-lsp check --fix`, and keeps a pull
- * request with the result up to date. Returns a one-line outcome.
+ * request with the result up to date. The bot never pushes to the repository
+ * itself: the fixes go to a fork owned by the token's user, and the pull
+ * request comes from there. Returns a one-line outcome.
  */
 export async function upgradeRepository(
   target: Target,
   { github, token, lspBin, dryRun = false }: UpgradeOptions,
 ): Promise<string> {
   const { repo } = target;
-  const lspVersion = verifyLsp(lspBin);
 
   // The token reaches git only, and only for github.com; composer and the
   // language server run without it.
   const { BOT_GITHUB_TOKEN: _token, ...env } = process.env;
+  const lspVersion = verifyLsp(lspBin, env);
   const credentials = Buffer.from(`x-access-token:${token}`).toString('base64');
   const gitEnv: NodeJS.ProcessEnv = {
     ...env,
@@ -45,10 +72,14 @@ export async function upgradeRepository(
     target.branch || (await github.get<{ default_branch: string }>(`/repos/${repo}`)).default_branch;
   const work = mkdtempSync(join(tmpdir(), 'upgrader-'));
   const clone = join(work, 'repo');
+  let checkout = clone;
+  // Composer and the fixer write into the clone before git commits and pushes
+  // with the token, so nothing they could leave in .git may run.
+  const safe = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
   const git = (args: string[], options: RunOptions = {}) =>
-    run('git', args, { cwd: clone, env, ...options });
+    run('git', [...safe, ...args], { cwd: checkout, env, ...options });
   const gitSucceeds = (args: string[], options: RunOptions = {}) =>
-    tryRun('git', args, { cwd: clone, env, capture: true, ...options }) !== null;
+    tryRun('git', [...safe, ...args], { cwd: checkout, env, capture: true, ...options }) !== null;
 
   try {
     console.log(`==> ${repo}: cloning ${base}`);
@@ -56,21 +87,16 @@ export async function upgradeRepository(
       env: gitEnv,
     });
 
-    if (target.composer_install && existsSync(join(clone, 'composer.json'))) {
-      console.log(`==> ${repo}: composer install`);
-      run(
-        'composer',
-        ['install', '--no-interaction', '--no-progress', '--no-scripts', '--no-plugins', '--ignore-platform-reqs'],
-        { cwd: clone, env },
-      );
-    }
+    const workspace = prepareWorkspace(target, { clone, work, env });
+    checkout = workspace.checkout;
 
     console.log(`==> ${repo}: ${lspVersion} check --fix`);
-    const summary = check(target, { lspBin, clone, work, env });
+    const summary = check(target, { lspBin, workspace, work, env });
 
     git(['add', '--update', '--', ...target.paths]);
     const changed = !gitSucceeds(['diff', '--cached', '--quiet']);
-    const head = `${repo.split('/')[0]}:${target.pr_branch}`;
+    const user = await github.get<{ login: string; id: number }>('/user');
+    const head = `${user.login}:${target.pr_branch}`;
     const pulls = (state: 'open' | 'all') =>
       github.get<PullRequest[]>(`/repos/${repo}/pulls?state=${state}&head=${encodeURIComponent(head)}`);
 
@@ -91,27 +117,38 @@ export async function upgradeRepository(
         body: `Nothing is left to fix on \`${base}\`, closing.`,
       });
       await github.patch(`/repos/${repo}/pulls/${obsolete.number}`, { state: 'closed' });
-      await github.delete(`/repos/${repo}/git/refs/heads/${target.pr_branch}`);
+      if (obsolete.head.repo) {
+        await github.delete(`/repos/${obsolete.head.repo.full_name}/git/refs/heads/${target.pr_branch}`);
+      }
       return report(repo, `nothing to fix, closed ${obsolete.html_url}`);
     }
 
-    const user = await github.get<{ login: string; id: number }>('/user');
     const name = process.env.BOT_GIT_NAME ?? user.login;
     const email = process.env.BOT_GIT_EMAIL ?? `${user.id}+${user.login}@users.noreply.github.com`;
     git([
       '-c', `user.name=${name}`,
       '-c', `user.email=${email}`,
-      'commit', '--quiet', '--message', target.commit_message,
+      'commit', '--quiet', '--no-verify', '--message', target.commit_message,
     ]);
+
+    const fork = await ensureFork(github, { repo, base, login: user.login, gitEnv });
+    const remote = `https://github.com/${fork}.git`;
 
     // Push only when the result differs from what the branch already holds, so
     // an unchanged run does not retrigger the target's CI.
     const ref = `refs/heads/${target.pr_branch}`;
     const upToDate =
-      gitSucceeds(['fetch', '--quiet', '--depth', '1', 'origin', ref], { env: gitEnv }) &&
+      gitSucceeds(['fetch', '--quiet', '--depth', '1', remote, ref], { env: gitEnv }) &&
       gitSucceeds(['diff', '--quiet', 'FETCH_HEAD', 'HEAD']);
     if (!upToDate) {
-      git(['push', '--quiet', '--force', 'origin', `HEAD:${ref}`], { env: gitEnv });
+      const push = ['push', '--quiet', '--force', '--no-verify', remote, `HEAD:${ref}`];
+      if (!gitSucceeds(push, { env: gitEnv })) {
+        // A fork that could not be synced lacks the base commit, and a shallow
+        // clone cannot supply its history.
+        console.log(`==> ${repo}: fetching the full history for ${fork}`);
+        git(['fetch', '--quiet', '--unshallow', 'origin'], { env: gitEnv });
+        git(push, { env: gitEnv });
+      }
     }
 
     const body = pullRequestBody(target, { base, lspVersion, summary });
@@ -129,9 +166,10 @@ export async function upgradeRepository(
 
     const created = await github.post<PullRequest>(`/repos/${repo}/pulls`, {
       title: target.pr_title,
-      head: target.pr_branch,
+      head,
       base,
       body,
+      ...(fork === repo ? {} : { maintainer_can_modify: true }),
     });
     if (target.labels.length > 0) {
       await github
@@ -144,19 +182,120 @@ export async function upgradeRepository(
   }
 }
 
+/**
+ * Returns the repository of the token's user to push to: its fork of `repo`,
+ * created when missing and synced with the base branch. A repository the
+ * user owns is pushed to directly, since it cannot be forked by its owner.
+ */
+async function ensureFork(
+  github: GitHub,
+  { repo, base, login, gitEnv }: { repo: string; base: string; login: string; gitEnv: NodeJS.ProcessEnv },
+): Promise<string> {
+  if (repo.split('/')[0]!.toLowerCase() === login.toLowerCase()) {
+    return repo;
+  }
+
+  // Answers with the existing fork when there is one.
+  const { full_name: fork } = await github.post<{ full_name: string }>(`/repos/${repo}/forks`, {});
+  const remote = `https://github.com/${fork}.git`;
+  // Forking is asynchronous: wait until the fork has branches.
+  for (let attempt = 0; ; attempt++) {
+    if (tryRun('git', ['ls-remote', '--exit-code', '--heads', remote], { env: gitEnv, capture: true }) !== null) {
+      break;
+    }
+    if (attempt === 30) {
+      throw new Error(`${fork} was not ready after forking ${repo}`);
+    }
+    await sleep(4000);
+  }
+
+  // The commit is based on the upstream branch, so the fork needs that
+  // history. Without it the push falls back to sending the full history.
+  await github
+    .post(`/repos/${fork}/merge-upstream`, { branch: base })
+    .catch((error: Error) => console.warn(`${repo}: could not sync ${fork}: ${error.message}`));
+  return fork;
+}
+
+/**
+ * Installs what the index needs to know the code's dependencies: the vendors
+ * of a project, or a Shopware shop around a plugin.
+ */
+function prepareWorkspace(
+  target: Target,
+  { clone, work, env }: { clone: string; work: string; env: NodeJS.ProcessEnv },
+): Workspace {
+  const { repo } = target;
+  // The packages are only read by the index, never run or deployed, so
+  // Composer's advisory, abandonment and cooldown policies must not stop the
+  // install. The variables cover Composer versions the flags do not.
+  env = { ...env, COMPOSER_NO_AUDIT: '1', COMPOSER_NO_BLOCKING: '1', COMPOSER_NO_SECURITY_BLOCKING: '1' };
+  const standalone: Workspace = { root: clone, checkout: clone, prefix: '' };
+  const manifestFile = join(clone, 'composer.json');
+  if (!target.composer_install) {
+    return standalone;
+  }
+
+  if (target.type === 'project') {
+    if (existsSync(manifestFile)) {
+      console.log(`==> ${repo}: composer install`);
+      run('composer', ['install', ...COMPOSER_FLAGS, '--no-plugins'], { cwd: clone, env });
+    }
+    return standalone;
+  }
+
+  if (!existsSync(manifestFile)) {
+    throw new Error('a plugin needs a composer.json; set composer_install: false to check it as it is');
+  }
+  const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as {
+    name?: string;
+    require?: Record<string, string>;
+  };
+  if (!manifest.name || !COMPOSER_PACKAGE.test(manifest.name)) {
+    throw new Error(`composer.json has no valid package name: ${JSON.stringify(manifest.name)}`);
+  }
+  const constraint = target.shopware_version || manifest.require?.['shopware/core'] || '';
+  if (constraint.startsWith('-')) {
+    throw new Error(`invalid Shopware constraint ${JSON.stringify(constraint)}`);
+  }
+
+  // The template's own plugins (Symfony Flex) lay out the project; its scripts
+  // would boot the shop, which needs a database.
+  const shop = join(work, 'shop');
+  console.log(`==> ${repo}: creating a Shopware ${constraint || 'latest'} shop`);
+  run('composer', ['create-project', ...COMPOSER_FLAGS, 'shopware/production', shop, ...(constraint ? [constraint] : [])], {
+    cwd: work,
+    env,
+  });
+
+  // custom/plugins/* is a path repository of the template, so the plugin is
+  // linked into vendor/ and its dependencies are installed next to Shopware.
+  const prefix = join('custom', 'plugins', repo.split('/')[1]!);
+  mkdirSync(join(shop, 'custom', 'plugins'), { recursive: true });
+  renameSync(clone, join(shop, prefix));
+  console.log(`==> ${repo}: composer require ${manifest.name}`);
+  run(
+    'composer',
+    ['require', ...COMPOSER_FLAGS, '--no-plugins', '--with-all-dependencies', `${manifest.name}:*@dev`],
+    { cwd: shop, env },
+  );
+  return { root: shop, checkout: join(shop, prefix), prefix };
+}
+
 /** Runs the fixer and returns its summary (what it writes to stderr). */
 function check(
   target: Target,
-  { lspBin, clone, work, env }: { lspBin: string; clone: string; work: string; env: NodeJS.ProcessEnv },
+  { lspBin, workspace, work, env }: { lspBin: string; workspace: Workspace; work: string; env: NodeJS.ProcessEnv },
 ): string {
+  const paths = target.paths.map((path) => join(workspace.prefix, path));
   const only = target.only.length > 0 ? ['--only', target.only.join(',')] : [];
   // The remaining findings go to stdout and can be huge; only the summary matters here.
   const findings = openSync(join(work, 'findings.txt'), 'w');
   try {
     const result = spawnSync(
       lspBin,
-      ['--color', 'never', 'check', '--fix', '--fail-on', 'off', ...only, ...target.args, ...target.paths],
-      { cwd: clone, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', findings, 'pipe'] },
+      ['--color', 'never', 'check', '--fix', '--fail-on', 'off', ...only, ...target.args, ...paths],
+      { cwd: workspace.root, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', findings, 'pipe'] },
     );
     if (result.error) {
       throw new Error(`${lspBin}: ${result.error.message}`);
@@ -200,7 +339,7 @@ function pullRequestBody(
   }
   lines.push(
     '',
-    `Maintained by ${maintainer}. The branch is force-pushed whenever the fixes change, so commits added here are lost; close the pull request to reject these fixes.`,
+    `Maintained by ${maintainer}. The branch is force-pushed whenever the fixes change, so commits added to it are lost; close the pull request to reject these fixes.`,
   );
   return lines.join('\n');
 }

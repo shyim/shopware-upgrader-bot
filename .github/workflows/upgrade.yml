@@ -1,6 +1,6 @@
 name: Upgrade repositories
 
-# Runs `shopware-lsp check --fix` on every repository of repositories.json and
+# Runs `shopware-lsp check --fix` on every repository of repositories.ts and
 # opens or updates a pull request with the result.
 #
 #   prepare (repository list, shopware-lsp binary) ─ upgrade (one job per repository)
@@ -72,7 +72,15 @@ jobs:
           LSP_REF: ${{ steps.lsp.outputs.ref }}
         run: node bin/bot.ts lsp download "$LSP_REF" dist
 
-      # `lsp.version: source:<ref>`: build that commit of shopware/shopware-lsp.
+      # `lsp.version: source:<ref>`: a binary shopware-lsp's own workflows built for it.
+      - name: Download prebuilt binary
+        if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'artifact'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LSP_REF: ${{ steps.lsp.outputs.ref }}
+        run: node bin/bot.ts lsp download-artifact "$LSP_REF" dist
+
+      # No prebuilt binary (they expire after a week): build that commit.
       - name: Checkout shopware-lsp
         if: steps.binary.outputs.cache-hit != 'true' && steps.lsp.outputs.kind == 'source'
         uses: actions/checkout@v7.0.1

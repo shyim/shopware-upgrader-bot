@@ -12,6 +12,8 @@ export class GitHubError extends Error {
 export interface PullRequest {
   number: number;
   html_url: string;
+  /** `repo` is null once the fork is deleted. */
+  head: { repo: { full_name: string } | null };
 }
 
 export interface Release {
@@ -26,6 +28,21 @@ export interface GitHub {
   delete(path: string): Promise<void>;
   /** Downloads a release asset or any other public URL. */
   download(url: string): Promise<Buffer>;
+  /** Downloads an API resource that answers with a file, such as an artifact archive. */
+  getFile(path: string): Promise<Buffer>;
+}
+
+export interface Artifact {
+  id: number;
+  name: string;
+  expired: boolean;
+  created_at: string;
+  workflow_run: {
+    head_branch: string;
+    head_sha: string;
+    repository_id: number;
+    head_repository_id: number;
+  };
 }
 
 /** A minimal GitHub REST client. The token is optional for public reads. */
@@ -54,6 +71,15 @@ export function createGitHub(token?: string): GitHub {
     post: (path, body) => request('POST', path, body),
     patch: (path, body) => request('PATCH', path, body),
     delete: (path) => request('DELETE', path),
+
+    async getFile(path) {
+      // fetch drops the authorization header when GitHub redirects to its storage.
+      const response = await fetch(`${API}${path}`, { headers });
+      if (!response.ok) {
+        throw new GitHubError('GET', path, response.status, await response.text());
+      }
+      return Buffer.from(await response.arrayBuffer());
+    },
 
     async download(url) {
       const response = await fetch(url, { headers: { 'user-agent': headers['user-agent']! } });

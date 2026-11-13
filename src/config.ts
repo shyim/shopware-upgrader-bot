@@ -1,44 +1,81 @@
-import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-/** One repository of repositories.json, merged with the defaults. */
-export interface Target {
-  /** `owner/name` on github.com. */
-  repo: string;
-  /** Base branch; empty selects the repository's default branch. */
-  branch: string;
-  /** Files or directories to check, relative to the repository root. */
-  paths: string[];
-  /** Rule IDs or prefixes (`twig.html.*`) to fix; empty fixes every rule. */
-  only: string[];
-  /** Extra flags for `shopware-lsp check`. */
-  args: string[];
-  /** Run `composer install` first so the index knows Shopware and the vendors. */
-  composer_install: boolean;
-  /** Branch the bot force-pushes to. */
-  pr_branch: string;
-  pr_title: string;
-  commit_message: string;
-  labels: string[];
+/** Settings of one repository; every one of them has a default. */
+export interface RepositoryOptions {
+  /** Base branch. Default: the repository's default branch. */
+  branch?: string;
+  /** Files or directories to check, relative to the repository root. Default: `['.']`. */
+  paths?: string[];
+  /** Rule IDs or prefixes (`twig.html.*`) to fix. Default: every rule. */
+  only?: string[];
+  /** Extra flags for `shopware-lsp check`, e.g. `--allow-unsupported-project`. */
+  args?: string[];
+  /**
+   * Install the dependencies first so the index knows Shopware and the
+   * vendors: `composer install` for a project, a Shopware shop built around a
+   * plugin. `false` checks the clone as it is. Default: `true`.
+   */
+  composer_install?: boolean;
+  /**
+   * Composer constraint of the shop a plugin is checked in. Default: the
+   * plugin's own `shopware/core` requirement, of which the newest match is used.
+   */
+  shopware_version?: string;
+  /** Branch the bot force-pushes to. Default: `shopware-lsp/auto-fix`. */
+  pr_branch?: string;
+  pr_title?: string;
+  commit_message?: string;
+  /** Labels for a new pull request; they must exist in the repository. */
+  labels?: string[];
 }
 
+export interface RepositoryEntry extends RepositoryOptions {
+  /** `owner/name` on github.com. */
+  repo: `${string}/${string}`;
+  /**
+   * `plugin`: the repository is one Shopware plugin. A Shopware shop is
+   * created around it and the plugin is required into it, so the plugin is
+   * checked against the Shopware and the dependencies it runs with.
+   * `project`: the repository is a whole Shopware or Symfony project and is
+   * checked in place.
+   */
+  type: 'plugin' | 'project';
+}
+
+/**
+ * Which shopware-lsp to run: the newest release (pre-releases included), a
+ * release tag, or a branch, tag or commit of shopware/shopware-lsp. For the
+ * last one a binary its workflows built is used, else it is built here.
+ */
+export type LspVersion = 'latest' | `${number}.${number}.${number}` | `source:${string}`;
+
+/** The shape of repositories.ts. */
+export interface BotConfig {
+  lsp?: { version?: LspVersion };
+  /** Applied to every repository; an entry may override any of them. */
+  defaults?: RepositoryOptions;
+  repositories: RepositoryEntry[];
+}
+
+/** Types the default export of repositories.ts. */
+export const defineConfig = (config: BotConfig): BotConfig => config;
+
+/** One repository, merged with the defaults. */
+export type Target = Required<RepositoryEntry>;
+
 export interface Config {
-  /** `latest`, a release tag, or `source:<git ref>`. */
   lspVersion: string;
   repositories: Target[];
 }
 
-interface RawConfig {
-  lsp?: { version?: string };
-  defaults?: Partial<Omit<Target, 'repo'>>;
-  repositories?: (string | Partial<Target>)[];
-}
-
-const BUILT_IN_DEFAULTS: Omit<Target, 'repo'> = {
+const BUILT_IN_DEFAULTS: Required<RepositoryOptions> = {
   branch: '',
   paths: ['.'],
   only: [],
   args: [],
   composer_install: true,
+  shopware_version: '',
   pr_branch: 'shopware-lsp/auto-fix',
   pr_title: 'chore: apply shopware-lsp fixes',
   commit_message: 'chore: apply shopware-lsp fixes',
@@ -47,16 +84,27 @@ const BUILT_IN_DEFAULTS: Omit<Target, 'repo'> = {
 
 const REPOSITORY = /^[\w.-]+\/[\w.-]+$/;
 
-export const configPath = (): string | URL =>
-  process.env.CONFIG_FILE ?? new URL('../repositories.json', import.meta.url);
+/** Loads repositories.ts (or `CONFIG_FILE`) and merges every entry with the defaults. */
+export async function loadConfig(): Promise<Config> {
+  const file = process.env.CONFIG_FILE
+    ? pathToFileURL(resolve(process.env.CONFIG_FILE))
+    : new URL('../repositories.ts', import.meta.url);
+  const raw = ((await import(file.href)) as { default?: BotConfig }).default;
+  if (!raw || !Array.isArray(raw.repositories)) {
+    throw new Error(`${file.pathname} must default-export a config with a repositories list`);
+  }
+  return resolveConfig(raw);
+}
 
-/** Reads repositories.json and merges every entry with the defaults. */
-export function loadConfig(file: string | URL = configPath()): Config {
-  const raw = JSON.parse(readFileSync(file, 'utf8')) as RawConfig;
+/**
+ * Merges every entry with the defaults. The types catch most mistakes in an
+ * editor; this also holds when the bot runs without a type check.
+ */
+export function resolveConfig(raw: BotConfig): Config {
   const defaults = { ...BUILT_IN_DEFAULTS, ...raw.defaults };
 
-  const repositories = (raw.repositories ?? []).map((entry) => {
-    const target = { ...defaults, ...(typeof entry === 'string' ? { repo: entry } : entry) };
+  const repositories = raw.repositories.map((entry) => {
+    const target = { ...defaults, ...entry };
     validate(target, entry);
     return target;
   });
@@ -79,16 +127,19 @@ export function selectRepositories(config: Config, filter?: string): Target[] {
     (target) => target.repo.toLowerCase() === filter.toLowerCase(),
   );
   if (selected.length === 0) {
-    throw new Error(`${filter} is not listed in repositories.json`);
+    throw new Error(`${filter} is not listed in repositories.ts`);
   }
   return selected;
 }
 
-/** Rejects what the JSON file may hold but a target must not. */
-function validate(target: Partial<Target>, entry: unknown): asserts target is Target {
-  const repo = target.repo;
+/** Rejects the values the types cannot rule out. */
+function validate(target: Target, entry: unknown): void {
+  const repo: unknown = target.repo;
   if (typeof repo !== 'string' || !REPOSITORY.test(repo) || repo.split('/').some((part) => /^\.+$/.test(part))) {
     throw new Error(`invalid repository entry: ${JSON.stringify(entry)}`);
+  }
+  if (target.type !== 'plugin' && target.type !== 'project') {
+    throw new Error(`${repo}: type must be 'plugin' or 'project'`);
   }
   for (const key of ['paths', 'only', 'args', 'labels'] as const) {
     const list: unknown = target[key];
@@ -96,11 +147,11 @@ function validate(target: Partial<Target>, entry: unknown): asserts target is Ta
       throw new Error(`${repo}: ${key} must be a list of strings`);
     }
   }
-  if (target.paths!.length === 0) {
+  if (target.paths.length === 0) {
     throw new Error(`${repo}: paths must not be empty`);
   }
   // Paths end up as arguments of shopware-lsp and git inside the clone.
-  for (const path of target.paths!) {
+  for (const path of target.paths) {
     if (path.startsWith('-') || path.startsWith('/') || path.split('/').includes('..')) {
       throw new Error(`${repo}: path ${JSON.stringify(path)} must stay inside the repository`);
     }
@@ -111,10 +162,13 @@ function validate(target: Partial<Target>, entry: unknown): asserts target is Ta
       throw new Error(`${repo}: ${key} must not be empty`);
     }
   }
-  if (target.pr_branch!.startsWith('-')) {
+  if (target.pr_branch.startsWith('-')) {
     throw new Error(`${repo}: invalid pr_branch`);
   }
   if (typeof target.branch !== 'string' || target.branch.startsWith('-')) {
     throw new Error(`${repo}: invalid branch`);
+  }
+  if (typeof target.shopware_version !== 'string' || target.shopware_version.startsWith('-')) {
+    throw new Error(`${repo}: invalid shopware_version`);
   }
 }
